@@ -1,11 +1,11 @@
 PDFCleaner – Drag-and-Drop PDF/A Repair Tool
 --------------------------------------------
 
-✅ Cleans broken or non-compliant PDFs
-✅ Converts to PDF/A using Ghostscript
-✅ Works offline – no installation needed
-✅ Supports batch drag-and-drop
-✅ Skips non-PDF files silently
+✅ Cleans broken or non-compliant PDFs  
+✅ Converts to PDF/A using Ghostscript  
+✅ Works offline – no installation needed  
+✅ Supports batch drag-and-drop  
+✅ Skips non-PDF files silently  
 
 How to Use:
 1. Place your PDFs in a folder.

@@ -94,6 +94,32 @@ Run:
 python -m unittest discover -s tests -v
 ```
 
+Targeted validation for new high-risk paths:
+
+```bash
+python -m unittest tests.test_pdf_cleaner_pipeline.PdfCleanerPipelineTests.test_parallel_batch_worker_failure_does_not_stop_other_files -v
+python -m unittest tests.test_pdf_cleaner_pipeline.PdfCleanerPipelineTests.test_auto_mode_real_image_only_pdf_uses_passthrough -v
+```
+
+## Local Sample Comparison Report
+
+Run a directory-level comparison report (recursive) for real sample sets such as Shopify exports:
+
+```bash
+python tools/run_sample_report.py C:\samples\shopify --mode auto --workers 4 --csv reports\shopify_auto.csv
+```
+
+Report columns:
+
+- `classification`
+- `mode_used`
+- `input_size`
+- `output_size`
+- `size_ratio` (`output_size / input_size`)
+- `duration_seconds`
+- `success`
+- `reason` (failure reason/message when not successful)
+
 ## Packaging a Portable Standalone Windows EXE
 
 Recommended build approach: **PyInstaller one-folder (`--onedir`)**
@@ -105,28 +131,51 @@ Reason:
 - Easier to bundle Ghostscript binaries (`bin/gswin64c.exe`, `bin/gsdll64.dll`)
 - Better behavior for a drag-and-drop utility distributed as a portable folder
 
-### Build command (example)
-
-From repository root:
+### Prerequisites
 
 ```bash
-pyinstaller ^
-  --noconfirm ^
-  --clean ^
-  --onedir ^
-  --name pdf_cleaner ^
-  --add-binary "bin\\gswin64c.exe;bin" ^
-  --add-binary "bin\\gsdll64.dll;bin" ^
-  pdf_cleaner.py
+python -m pip install --upgrade pyinstaller
+```
+
+### Portable folder build (preferred)
+
+From repository root (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows_portable.ps1
+```
+
+Equivalent direct command:
+
+```bash
+python -m PyInstaller --noconfirm --clean --onedir --name pdf_cleaner --add-binary "bin\\gswin64c.exe;bin" --add-binary "bin\\gsdll64.dll;bin" pdf_cleaner.py
 ```
 
 Resulting deliverable:
 
 - `dist\pdf_cleaner\pdf_cleaner.exe` (plus bundled runtime files in same folder)
 
+Bundling requirement:
+
+- `bin\gswin64c.exe`
+- `bin\gsdll64.dll`
+
 ### One-file EXE note
 
-`--onefile` is possible, but not preferred for this tool because startup extraction overhead and native dependency loading can be less predictable for high-volume drag-and-drop usage.
+Optional one-file build (run only after validating one-folder build):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows_portable.ps1 -OneFile
+```
+
+`--onefile` remains less predictable for startup and native dependency loading.
+
+### Drag-and-drop validation after packaging
+
+1. Build using the one-folder command above.
+2. Drag a PDF file or a folder of PDFs onto `dist\pdf_cleaner\pdf_cleaner.exe`.
+3. Confirm outputs are written under `fixed_pdf` per source routing.
+4. Confirm mixed success/failure inputs still complete with a batch summary.
 
 ## License
 

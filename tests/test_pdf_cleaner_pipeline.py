@@ -47,6 +47,34 @@ startxref
 """
 
 
+def _build_minimal_pdf(objects: list[bytes]) -> bytes:
+    """Build a minimal PDF document from object payloads."""
+    header = b"%PDF-1.4\n"
+    body_parts: list[bytes] = [header]
+    offsets: list[int] = [0]
+    cursor = len(header)
+
+    for index, obj_payload in enumerate(objects, start=1):
+        obj_block = b"".join(
+            [f"{index} 0 obj\n".encode("ascii"), obj_payload, b"\nendobj\n"]
+        )
+        offsets.append(cursor)
+        body_parts.append(obj_block)
+        cursor += len(obj_block)
+
+    xref_offset = cursor
+    xref_lines: list[bytes] = [f"xref\n0 {len(objects) + 1}\n".encode("ascii")]
+    xref_lines.append(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        xref_lines.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+
+    trailer = (
+        f"trailer\n<< /Root 1 0 R /Size {len(objects) + 1} >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n"
+    ).encode("ascii")
+    return b"".join(body_parts + xref_lines + [trailer])
+
+
 def write_text_pdf(path: Path) -> None:
     """Write a single-page text PDF fixture with font resources."""
     path.write_bytes(MINIMAL_TEXT_PDF)
@@ -54,6 +82,47 @@ def write_text_pdf(path: Path) -> None:
         pdf.docinfo["/Producer"] = "Skia/PDF m120"
         pdf.docinfo["/Creator"] = "Chromium"
         pdf.docinfo["/Title"] = "Invoice"
+        pdf.save(
+            path,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            compress_streams=True,
+        )
+
+
+def write_image_only_pdf(path: Path) -> None:
+    """Write a single-page PDF fixture that draws only an embedded image XObject."""
+    image_bytes = b"\x00\x00\x00"
+    content_stream = b"q 300 0 0 144 0 0 cm /Im0 Do Q"
+    image_object = b"".join(
+        [
+            b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 ",
+            b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\n",
+            b"stream\n",
+            image_bytes,
+            b"\nendstream",
+        ]
+    )
+    content_object = b"".join(
+        [
+            f"<< /Length {len(content_stream)} >>\n".encode("ascii"),
+            b"stream\n",
+            content_stream,
+            b"\nendstream",
+        ]
+    )
+    image_pdf = _build_minimal_pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+            content_object,
+            image_object,
+        ]
+    )
+    path.write_bytes(image_pdf)
+
+    with pikepdf.Pdf.open(path, allow_overwriting_input=True) as pdf:
+        pdf.docinfo["/Producer"] = "ImageFixture"
         pdf.save(
             path,
             object_stream_mode=pikepdf.ObjectStreamMode.generate,
@@ -178,6 +247,34 @@ class PdfCleanerPipelineTests(unittest.TestCase):
             assert diagnostics.output_path is not None
             self.assertEqual(diagnostics.output_path.read_bytes(), source_pdf.read_bytes())
 
+    def test_auto_mode_real_image_only_pdf_uses_passthrough(self) -> None:
+        """Auto mode should passthrough a real image-only PDF fixture."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_pdf = temp_root / "scan.pdf"
+            output_dir = temp_root / "out"
+            write_image_only_pdf(source_pdf)
+
+            inspection = pdf_cleaner.inspect_pdf(source_pdf)
+            self.assertEqual(inspection.pdf_kind, pdf_cleaner.PdfKind.IMAGE_ONLY)
+            self.assertFalse(inspection.has_text)
+            self.assertFalse(inspection.has_fonts)
+            self.assertTrue(inspection.has_images)
+
+            diagnostics = pdf_cleaner.clean_pdf(
+                input_path=source_pdf,
+                output_dir=output_dir,
+                requested_mode=pdf_cleaner.RequestedMode.AUTO,
+            )
+
+            self.assertTrue(diagnostics.success)
+            self.assertEqual(
+                diagnostics.mode_used,
+                pdf_cleaner.IMAGE_PASSTHROUGH_MODE_LABEL,
+            )
+            assert diagnostics.output_path is not None
+            self.assertEqual(diagnostics.output_path.read_bytes(), source_pdf.read_bytes())
+
     def test_batch_continues_after_per_file_failure(self) -> None:
         """A failing file should not stop the batch and summary should be accurate."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -219,6 +316,70 @@ class PdfCleanerPipelineTests(unittest.TestCase):
             self.assertFalse(second_result.success)
             assert second_result.failure_reason is not None
             self.assertIn("forced_failure", second_result.failure_reason)
+
+    def test_parallel_batch_worker_failure_does_not_stop_other_files(self) -> None:
+        """Parallel batch processing should isolate failures and avoid output collisions."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_a = temp_root / "source_a"
+            source_b = temp_root / "source_b"
+            source_bad = temp_root / "source_bad"
+            source_a.mkdir(parents=True, exist_ok=True)
+            source_b.mkdir(parents=True, exist_ok=True)
+            source_bad.mkdir(parents=True, exist_ok=True)
+
+            first_pdf = source_a / "invoice.pdf"
+            second_pdf = source_b / "invoice.pdf"
+            broken_pdf = source_bad / "broken.pdf"
+            write_text_pdf(first_pdf)
+            write_text_pdf(second_pdf)
+            broken_pdf.write_bytes(b"%PDF-1.4\nthis is not a valid PDF body\n")
+
+            shared_output_dir = temp_root / "shared_out"
+
+            with mock.patch("pdf_cleaner.os.cpu_count", return_value=4):
+                summary = pdf_cleaner.clean_batch(
+                    input_paths=[first_pdf, second_pdf, broken_pdf],
+                    output_dir=shared_output_dir,
+                    requested_mode=pdf_cleaner.RequestedMode.AUTO,
+                    batch_settings=pdf_cleaner.BatchSettings(
+                        enable_parallel=True,
+                        max_workers=3,
+                        parallel_threshold=1,
+                    ),
+                )
+
+            self.assertEqual(summary.worker_count, 3)
+            self.assertEqual(summary.total_files, 3)
+            self.assertEqual(summary.succeeded, 2)
+            self.assertEqual(summary.failed, 1)
+            self.assertEqual(summary.skipped, 0)
+            self.assertEqual(summary.text_pdfs_processed, 2)
+            self.assertEqual(summary.image_only_pdfs_processed, 0)
+
+            output_paths = [result.output_path for result in summary.results]
+            self.assertEqual(len(output_paths), 3)
+            self.assertEqual(len(output_paths), len(set(output_paths)))
+
+            successful_results = [result for result in summary.results if result.success]
+            self.assertEqual(len(successful_results), 2)
+            for successful in successful_results:
+                assert successful.output_path is not None
+                self.assertTrue(successful.output_path.exists())
+
+            successful_output_names = sorted(
+                successful.output_path.name
+                for successful in successful_results
+                if successful.output_path is not None
+            )
+            self.assertEqual(
+                successful_output_names,
+                ["invoice_cleaned.pdf", "invoice_cleaned_1.pdf"],
+            )
+
+            failed_result = next(result for result in summary.results if not result.success)
+            assert failed_result.failure_reason is not None
+            self.assertIn("structural_error", failed_result.failure_reason)
 
     def test_dropped_folder_routes_outputs_to_folder_fixed_pdf(self) -> None:
         """Dropped folder inputs should write under <folder>/fixed_pdf."""

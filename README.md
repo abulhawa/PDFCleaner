@@ -1,62 +1,54 @@
-# PDFCleaner - Drag-and-Drop PDF/A Repair Tool
+# PDFCleaner - Structural PDF Normalization (Python)
 
-A simple, portable tool to clean and convert PDFs to PDF/A format using Ghostscript.
+PDFCleaner keeps Python as the batch/orchestration layer and now uses a **structural-first** repair pipeline:
 
----
+1. Inspect input PDF characteristics
+2. Normalize/rewrite structure with `pikepdf` (qpdf-backed)
+3. Validate key output characteristics
+4. Fall back to Ghostscript compatibility conversion only when required
 
-## ✅ Features
+## Why this change
 
-✅ Cleans broken or non-compliant PDFs  
-✅ Converts to PDF/A using Ghostscript  
-✅ Works offline - no installation needed  
-✅ Supports batch drag-and-drop  
-✅ Skips non-PDF files silently  
-✅ Keeps PDFs in their original folders - no need to move them  
+The previous default path always ran Ghostscript PDF/A conversion, which can rasterize/rewrite aggressively and increase file size. The default path now avoids full-page rasterization whenever structural normalization is sufficient.
 
----
+## Features
 
-## 🖥 How to Use
+- Python drag-and-drop batch processing stays intact
+- Default `auto` mode: structural-first, fallback only if needed
+- `structural` mode: structural normalization only (no fallback)
+- `ghostscript` mode: explicit compatibility conversion
+- Per-file diagnostics:
+  - mode used
+  - text preserved (`yes/no`)
+  - fonts present (`yes/no`)
+  - output size change
 
-1. **Download and unzip** the tool (maintain the folder structure):
-   ```
-   PDFCleaner/
-   ├── pdf_cleaner.exe
-   └── bin/
-       ├── gswin64c.exe
-       └── gsdll64.dll
-   ```
+## Usage
 
-2. Select one or more PDF files **from anywhere** on your system.
+Drag one or more PDFs onto `pdf_cleaner.exe` (or run script directly).
 
-3. **Drag and drop** the PDFs onto `pdf_cleaner.exe`.
+### CLI modes
 
-4. Each file will be:
-   - Cleaned of extra metadata
-   - Converted to PDF/A-1b format
-   - Overwritten in place (original file is updated)
+```bash
+python pdf_cleaner.py --mode auto input1.pdf input2.pdf
+python pdf_cleaner.py --mode structural input.pdf
+python pdf_cleaner.py --mode ghostscript input.pdf
+```
 
----
+## Included files
 
-## 📦 Included
+- `pdf_cleaner.py` - Python source
+- `pdf_cleaner.exe` - packaged executable
+- `bin/gswin64c.exe` and `bin/gsdll64.dll` - Ghostscript runtime
 
-- `pdf_cleaner.exe` - the main executable
-- `clean_pdf.py` - Python source code (for transparency and reuse)
-- `bin/gswin64c.exe` - bundled Ghostscript engine
-- `bin/gsdll64.dll` - Ghostscript dependency
+## Tests
 
----
+Run tests with your `pdfclean` conda environment:
 
-## 🛑 If Windows Blocks the EXE
+```bash
+C:\Users\ali_a\miniconda3\envs\pdfclean\python.exe -m unittest discover -s tests -v
+```
 
-If you see "Windows protected your PC":
-1. Click **More info**
-2. Click **Run anyway**
-3. Or: right-click the `.exe` → **Properties** → check **Unblock**
+## License
 
----
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
-
-
-> Created by Ali Abul Hawa using Python, PikePDF, and Ghostscript.
+MIT License. See [LICENSE](LICENSE).

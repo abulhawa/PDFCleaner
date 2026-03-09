@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -211,6 +215,55 @@ class PdfCleanerPipelineTests(unittest.TestCase):
             self.assertTrue(diagnostics.success)
             self.assertEqual(diagnostics.output_path, output_dir / "invoice_cleaned_2.pdf")
             self.assertTrue((output_dir / "invoice_cleaned_2.pdf").exists())
+
+    def test_overwrite_flag_is_ignored_and_never_replaces_existing_file(self) -> None:
+        """Overwrite runtime setting should be ignored to protect existing outputs."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_pdf = temp_root / "invoice.pdf"
+            output_dir = temp_root / "out"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_text_pdf(source_pdf)
+
+            original_existing_bytes = b"do-not-overwrite"
+            existing_output = output_dir / "invoice_cleaned.pdf"
+            existing_output.write_bytes(original_existing_bytes)
+
+            diagnostics = pdf_cleaner.clean_pdf(
+                input_path=source_pdf,
+                output_dir=output_dir,
+                requested_mode=pdf_cleaner.RequestedMode.AUTO,
+                runtime_settings=pdf_cleaner.RuntimeSettings(
+                    overwrite_existing_output=True
+                ),
+            )
+
+            self.assertTrue(diagnostics.success)
+            self.assertEqual(diagnostics.output_path, output_dir / "invoice_cleaned_1.pdf")
+            self.assertEqual(existing_output.read_bytes(), original_existing_bytes)
+
+    def test_existing_explicit_output_path_is_not_replaced(self) -> None:
+        """Explicit pre-existing output paths should be rerouted to a collision-safe name."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_pdf = temp_root / "invoice.pdf"
+            output_dir = temp_root / "out"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_text_pdf(source_pdf)
+
+            explicit_output_path = output_dir / "invoice_cleaned.pdf"
+            explicit_output_path.write_bytes(b"keep-existing")
+
+            diagnostics = pdf_cleaner.clean_pdf(
+                input_path=source_pdf,
+                output_dir=output_dir,
+                requested_mode=pdf_cleaner.RequestedMode.AUTO,
+                output_path=explicit_output_path,
+            )
+
+            self.assertTrue(diagnostics.success)
+            self.assertEqual(diagnostics.output_path, output_dir / "invoice_cleaned_1.pdf")
+            self.assertEqual(explicit_output_path.read_bytes(), b"keep-existing")
 
     def test_auto_mode_image_only_uses_passthrough(self) -> None:
         """Auto mode should use image passthrough for image-only inspections."""
@@ -438,6 +491,292 @@ class PdfCleanerPipelineTests(unittest.TestCase):
             assert result_map["b.pdf"].output_path is not None
             self.assertEqual(result_map["a.pdf"].output_path.parent, expected_a)
             self.assertEqual(result_map["b.pdf"].output_path.parent, expected_b)
+
+    def test_windows_bulk_drop_warning_for_large_individual_file_list(self) -> None:
+        """Windows should warn for very large individual file-drop argument lists."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            dropped_files: list[str] = []
+            for index in range(pdf_cleaner.WINDOWS_ARG_LIST_WARNING_COUNT):
+                candidate = temp_root / f"drop_{index:04d}.pdf"
+                candidate.write_bytes(b"x")
+                dropped_files.append(str(candidate))
+
+            with mock.patch("pdf_cleaner.os.name", "nt"):
+                warning = pdf_cleaner._build_windows_bulk_drop_warning(dropped_files)
+
+            self.assertIsNotNone(warning)
+            assert warning is not None
+            self.assertIn("drag the containing folder", warning)
+
+    def test_windows_bulk_drop_warning_not_shown_for_folder_input(self) -> None:
+        """Windows warning should not appear when a folder is dropped."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            dropped_folder = temp_root / "incoming"
+            dropped_folder.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch("pdf_cleaner.os.name", "nt"):
+                warning = pdf_cleaner._build_windows_bulk_drop_warning(
+                    [str(dropped_folder)]
+                )
+
+            self.assertIsNone(warning)
+
+    def test_force_windows_exit_pause_detection(self) -> None:
+        """Packaged Windows runs should force a final keypress pause."""
+        with mock.patch("pdf_cleaner.os.name", "nt"), mock.patch.object(
+            pdf_cleaner.sys, "frozen", True, create=True
+        ):
+            self.assertTrue(pdf_cleaner._should_force_windows_exit_pause())
+
+        with mock.patch("pdf_cleaner.os.name", "nt"), mock.patch.object(
+            pdf_cleaner.sys, "frozen", True, create=True
+        ), mock.patch.object(pdf_cleaner.sys, "stdin", None):
+            self.assertTrue(pdf_cleaner._should_force_windows_exit_pause())
+
+        with mock.patch("pdf_cleaner.os.name", "nt"), mock.patch.object(
+            pdf_cleaner.sys, "frozen", False, create=True
+        ):
+            self.assertFalse(pdf_cleaner._should_force_windows_exit_pause())
+
+        with mock.patch("pdf_cleaner.os.name", "posix"), mock.patch.object(
+            pdf_cleaner.sys, "frozen", True, create=True
+        ):
+            self.assertFalse(pdf_cleaner._should_force_windows_exit_pause())
+
+    def test_parallel_batch_recovers_from_broken_process_pool(self) -> None:
+        """Broken process pools should fallback to sequential processing."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            first_pdf = temp_root / "first.pdf"
+            second_pdf = temp_root / "second.pdf"
+            output_dir = temp_root / "out"
+            write_text_pdf(first_pdf)
+            write_text_pdf(second_pdf)
+
+            def success_diagnostics(
+                input_path: Path,
+                output_path: Path,
+            ) -> pdf_cleaner.RepairDiagnostics:
+                return pdf_cleaner.RepairDiagnostics(
+                    input_path=input_path,
+                    output_path=output_path,
+                    success=True,
+                    skipped=False,
+                    mode_used=pdf_cleaner.STRUCTURAL_MODE_LABEL,
+                    pdf_kind=pdf_cleaner.PdfKind.TEXT_VECTOR,
+                    text_preserved=True,
+                    fonts_present=True,
+                    input_size=100,
+                    output_size=80,
+                    elapsed_seconds=0.01,
+                    message="ok",
+                    failure_reason=None,
+                )
+
+            fallback_inputs: list[str] = []
+
+            def fake_clean_pdf(
+                input_path: str | Path,
+                output_dir: str | Path,
+                requested_mode: pdf_cleaner.RequestedMode = pdf_cleaner.RequestedMode.AUTO,
+                runtime_settings: pdf_cleaner.RuntimeSettings | None = None,
+                gs_exe: str | None = None,
+                output_path: Path | None = None,
+            ) -> pdf_cleaner.RepairDiagnostics:
+                del output_dir, requested_mode, runtime_settings, gs_exe
+                input_file = Path(input_path)
+                assert output_path is not None
+                fallback_inputs.append(input_file.name)
+                return success_diagnostics(
+                    input_path=input_file,
+                    output_path=output_path,
+                )
+
+            class FakeExecutor:
+                """Minimal executor that simulates one broken pool future."""
+
+                def __init__(self, max_workers: int) -> None:
+                    del max_workers
+                    self.submit_count = 0
+
+                def __enter__(self) -> "FakeExecutor":
+                    return self
+
+                def __exit__(self, exc_type, exc, tb) -> bool:
+                    del exc_type, exc, tb
+                    return False
+
+                def submit(self, fn, worker_request: pdf_cleaner.WorkerRequest) -> Future:
+                    del fn
+                    future: Future = Future()
+                    self.submit_count += 1
+                    if self.submit_count == 1:
+                        future.set_exception(BrokenProcessPool("simulated_pool_break"))
+                    else:
+                        future.set_result(
+                            success_diagnostics(
+                                input_path=Path(worker_request.input_path),
+                                output_path=Path(worker_request.output_path),
+                            )
+                        )
+                    return future
+
+            with mock.patch("pdf_cleaner.os.cpu_count", return_value=4), mock.patch(
+                "pdf_cleaner.ProcessPoolExecutor", FakeExecutor
+            ), mock.patch("pdf_cleaner.clean_pdf", side_effect=fake_clean_pdf) as clean_mock:
+                summary = pdf_cleaner.clean_batch(
+                    input_paths=[first_pdf, second_pdf],
+                    output_dir=output_dir,
+                    requested_mode=pdf_cleaner.RequestedMode.AUTO,
+                    batch_settings=pdf_cleaner.BatchSettings(
+                        enable_parallel=True,
+                        max_workers=2,
+                        parallel_threshold=1,
+                    ),
+                )
+
+            self.assertEqual(summary.total_files, 2)
+            self.assertEqual(summary.succeeded, 2)
+            self.assertEqual(summary.failed, 0)
+            self.assertEqual(summary.worker_count, 2)
+            self.assertEqual(clean_mock.call_count, 1)
+            self.assertEqual(fallback_inputs, ["first.pdf"])
+
+    def test_select_console_results_suppresses_successes_for_large_batches(self) -> None:
+        """Large batches should print failures/skips only unless explicitly requested."""
+        success = pdf_cleaner.RepairDiagnostics(
+            input_path=Path("ok.pdf"),
+            output_path=Path("ok_cleaned.pdf"),
+            success=True,
+            skipped=False,
+            mode_used=pdf_cleaner.STRUCTURAL_MODE_LABEL,
+            pdf_kind=pdf_cleaner.PdfKind.TEXT_VECTOR,
+            text_preserved=True,
+            fonts_present=True,
+            input_size=100,
+            output_size=80,
+            elapsed_seconds=0.01,
+            message="ok",
+            failure_reason=None,
+        )
+        failure = pdf_cleaner.RepairDiagnostics(
+            input_path=Path("bad.pdf"),
+            output_path=Path("bad_cleaned.pdf"),
+            success=False,
+            skipped=False,
+            mode_used=pdf_cleaner.ERROR_MODE_LABEL,
+            pdf_kind=pdf_cleaner.PdfKind.UNKNOWN,
+            text_preserved=True,
+            fonts_present=False,
+            input_size=100,
+            output_size=100,
+            elapsed_seconds=0.01,
+            message="failed",
+            failure_reason="simulated_failure",
+        )
+        summary = pdf_cleaner.BatchSummary(
+            total_files=pdf_cleaner.DEFAULT_DETAILED_CONSOLE_RESULT_LIMIT + 1,
+            succeeded=1,
+            failed=1,
+            skipped=0,
+            text_pdfs_processed=1,
+            image_only_pdfs_processed=0,
+            total_processing_seconds=0.02,
+            average_processing_seconds=0.01,
+            worker_count=1,
+            results=(success, failure),
+        )
+
+        selected = pdf_cleaner._select_console_results(summary=summary, show_all_results=False)
+
+        self.assertEqual(selected, (failure,))
+
+    def test_select_console_results_show_all_keeps_successes(self) -> None:
+        """Explicit show-all mode should keep all diagnostics."""
+        success = pdf_cleaner.RepairDiagnostics(
+            input_path=Path("ok.pdf"),
+            output_path=Path("ok_cleaned.pdf"),
+            success=True,
+            skipped=False,
+            mode_used=pdf_cleaner.STRUCTURAL_MODE_LABEL,
+            pdf_kind=pdf_cleaner.PdfKind.TEXT_VECTOR,
+            text_preserved=True,
+            fonts_present=True,
+            input_size=100,
+            output_size=80,
+            elapsed_seconds=0.01,
+            message="ok",
+            failure_reason=None,
+        )
+        summary = pdf_cleaner.BatchSummary(
+            total_files=pdf_cleaner.DEFAULT_DETAILED_CONSOLE_RESULT_LIMIT + 10,
+            succeeded=1,
+            failed=0,
+            skipped=0,
+            text_pdfs_processed=1,
+            image_only_pdfs_processed=0,
+            total_processing_seconds=0.01,
+            average_processing_seconds=0.01,
+            worker_count=1,
+            results=(success,),
+        )
+
+        selected = pdf_cleaner._select_console_results(summary=summary, show_all_results=True)
+
+        self.assertEqual(selected, (success,))
+
+    def test_clean_batch_progress_callback_reports_completion(self) -> None:
+        """Batch progress callback should reach full completion count."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            first_pdf = temp_root / "first.pdf"
+            second_pdf = temp_root / "second.pdf"
+            write_text_pdf(first_pdf)
+            write_text_pdf(second_pdf)
+
+            updates: list[tuple[int, int]] = []
+            summary = pdf_cleaner.clean_batch(
+                input_paths=[first_pdf, second_pdf],
+                requested_mode=pdf_cleaner.RequestedMode.AUTO,
+                batch_settings=self._sequential_batch_settings(),
+                progress_callback=lambda completed, total: updates.append(
+                    (completed, total)
+                ),
+            )
+
+            self.assertEqual(summary.total_files, 2)
+            self.assertGreaterEqual(len(updates), 2)
+            self.assertEqual(updates[-1], (2, 2))
+
+    def test_print_batch_summary_uses_sentence_case_and_wall_time(self) -> None:
+        """Summary output should use user-friendly labels and wall-clock timing."""
+        summary = pdf_cleaner.BatchSummary(
+            total_files=10,
+            succeeded=8,
+            failed=1,
+            skipped=1,
+            text_pdfs_processed=9,
+            image_only_pdfs_processed=0,
+            total_processing_seconds=12.0,
+            average_processing_seconds=1.5,
+            worker_count=4,
+            results=tuple(),
+        )
+
+        output_buffer = StringIO()
+        with redirect_stdout(output_buffer):
+            pdf_cleaner.print_batch_summary(summary, wall_clock_seconds=5.0)
+        output = output_buffer.getvalue()
+
+        self.assertIn("[Summary]", output)
+        self.assertIn("Total files: 10", output)
+        self.assertIn("Wall time: 5.000 seconds", output)
+        self.assertIn("Average wall time per processed file: 0.556 seconds", output)
+        self.assertNotIn("total_processing_seconds", output)
+        self.assertNotIn("wall_clock_seconds", output)
+        self.assertNotIn("total_files=", output)
 
 
 if __name__ == "__main__":

@@ -150,7 +150,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        help="Reuse <stem>_cleaned.pdf instead of suffix allocation.",
+        help="Deprecated safety flag, ignored (existing files are never overwritten).",
     )
     parser.add_argument(
         "--csv",

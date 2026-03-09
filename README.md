@@ -43,6 +43,18 @@ Collision handling:
 
 - Drag one or more PDF files or folders onto `pdf_cleaner.exe`
 - The tool processes all discovered PDFs and writes outputs using the default policy above
+- In packaged Windows EXE runs, the summary stays visible and closes after you press a key
+
+Windows large-batch note:
+
+- Dragging very large lists of individual files can exceed Windows command-line limits before the app starts.
+- For large batches, drag the containing folder onto `pdf_cleaner.exe` instead.
+- Single-file and small file-list drops remain supported.
+
+Safety guarantees:
+
+- Input files are never modified or deleted.
+- Existing output files are never overwritten; collision-safe suffixes are always used.
 
 ### CLI usage
 
@@ -57,7 +69,8 @@ Optional flags:
 
 - `--output-dir <path>`: override default per-source `fixed_pdf` routing
 - `--no-parallel`: force sequential batch processing
-- `--overwrite-output`: reuse `<stem>_cleaned.pdf` instead of creating suffixes
+- `--overwrite-output`: deprecated safety flag, ignored (files are never overwritten)
+- `--show-all-results`: print per-file success lines even for large batches
 
 ## Modes
 
@@ -74,6 +87,7 @@ Optional flags:
 
 Batch execution reports:
 
+- live progress line (`[PROGRESS] completed/total`) during processing
 - total files
 - succeeded
 - failed
@@ -85,6 +99,12 @@ Batch execution reports:
 - per-file output path and failure reason
 
 One file failure does not stop the batch.
+If a worker process pool terminates unexpectedly, unresolved files are retried sequentially.
+For large batches, successful per-file lines are suppressed by default for performance.
+Use `--show-all-results` to print every per-file line.
+Summary timing uses end-to-end wall time, including:
+- wall time for the whole batch
+- average wall time per processed file
 
 ## Tests
 
@@ -119,6 +139,36 @@ Report columns:
 - `duration_seconds`
 - `success`
 - `reason` (failure reason/message when not successful)
+
+## Disposable Volume Stress Test
+
+Use one real sample PDF to generate many exact copies, then run the normal dropped-folder batch flow on those copies.
+
+What it does:
+
+- creates/uses a disposable input folder (`stress_test_input`)
+- duplicates one source PDF into deterministic names (`<stem>_0001.pdf`, etc.)
+- runs `clean_batch` on the generated folder (same processing path used by dropped folders)
+- writes outputs to `stress_test_input\fixed_pdf`
+- prints concise throughput/failure summary
+
+Exact command (default 1000 copies) in `pdfclean`:
+
+```powershell
+conda run -n pdfclean python tools\run_stress_batch.py C:\path\to\sample.pdf --count 1000 --reset
+```
+
+Optional worker cap:
+
+```powershell
+conda run -n pdfclean python tools\run_stress_batch.py C:\path\to\sample.pdf --count 1000 --reset --workers 4
+```
+
+All generated files are disposable. Cleanup command:
+
+```powershell
+Remove-Item -Recurse -Force .\stress_test_input
+```
 
 ## Packaging a Portable Standalone Windows EXE
 

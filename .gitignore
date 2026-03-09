@@ -1,0 +1,18 @@
+# Local/disposable data
+/original.pdf
+/stress_test_input/
+/fixed_pdf/
+
+# Build artifacts
+/build/
+/dist/
+/pdf_cleaner.spec
+/pdf_cleaner.exe
+
+# Python cache/bytecode
+__pycache__/
+*/__pycache__/
+*.py[cod]
+
+# Optional local-only files
+/How to use.txt

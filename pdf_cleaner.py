@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -10,10 +11,11 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import pikepdf
 from pikepdf import Dictionary, Pdf
@@ -23,6 +25,14 @@ DEFAULT_MAX_SIZE_MULTIPLIER: float = 4.0
 DEFAULT_OUTPUT_FOLDER_NAME: str = "fixed_pdf"
 DEFAULT_MAX_WORKERS_CAP: int = 4
 DEFAULT_PARALLEL_THRESHOLD: int = 8
+WINDOWS_ARG_LIST_WARNING_COUNT: int = 200
+WINDOWS_CMDLINE_WARNING_CHARS: int = 24000
+DEFAULT_DETAILED_CONSOLE_RESULT_LIMIT: int = 200
+PROGRESS_MIN_UPDATE_INTERVAL_SECONDS: float = 0.5
+OVERWRITE_IGNORED_NOTICE: str = (
+    "Safety mode is active: existing files are never overwritten. "
+    "--overwrite-output is ignored."
+)
 
 TEXT_SHOWING_OPERATORS: set[str] = {"Tj", "TJ", "'", '"'}
 VECTOR_DRAWING_OPERATORS: set[str] = {
@@ -93,7 +103,10 @@ class ValidationResult:
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    """Per-file runtime settings for deterministic output and validation."""
+    """Per-file runtime settings for deterministic output and validation.
+
+    overwrite_existing_output is retained for API compatibility but ignored for safety.
+    """
 
     overwrite_existing_output: bool = False
     max_size_multiplier: float = DEFAULT_MAX_SIZE_MULTIPLIER
@@ -170,6 +183,9 @@ class WorkerRequest:
     runtime_settings: RuntimeSettings
     gs_exe: str
     output_path: str
+
+
+ProgressCallback = Callable[[int, int], None]
 
 
 def _is_pdf_path(path: Path) -> bool:
@@ -454,14 +470,66 @@ def _safe_inspection(path: Path, fallback: PdfInspection) -> PdfInspection:
         return fallback
 
 
-def _pause_for_windows_dragdrop() -> None:
-    """Pause only in interactive sessions so users can read errors."""
+def _pause_for_windows_dragdrop(force_windows_pause: bool = False) -> None:
+    """Pause before exit so users can read summary output in drag-and-drop runs."""
+    if force_windows_pause and os.name == "nt":
+        try:
+            import msvcrt
+
+            print("Press any key to exit...")
+            msvcrt.getwch()
+            return
+        except Exception:
+            try:
+                os.system("pause > nul")
+                return
+            except Exception:
+                # Fall back to standard input prompt if Windows pause fails.
+                pass
+
     if not sys.stdin or not sys.stdin.isatty():
         return
     try:
         input("Press Enter to exit...")
     except EOFError:
         return
+
+
+def _should_force_windows_exit_pause() -> bool:
+    """Return True for packaged Windows runs that should always pause after summary."""
+    return os.name == "nt" and bool(getattr(sys, "frozen", False))
+
+
+def _estimate_windows_cmdline_length(args: Sequence[str]) -> int:
+    """Estimate Windows command-line size, including basic quoting overhead."""
+    executable_overhead = 32
+    return executable_overhead + sum(len(arg) + 3 for arg in args)
+
+
+def _build_windows_bulk_drop_warning(inputs: Sequence[str]) -> Optional[str]:
+    """Return guidance when Windows file-drop arguments are likely too large."""
+    if os.name != "nt" or not inputs:
+        return None
+
+    input_paths = [Path(item) for item in inputs]
+    has_folder_input = any(path.is_dir() for path in input_paths)
+    if has_folder_input:
+        return None
+
+    individual_file_count = sum(1 for path in input_paths if path.is_file())
+    estimated_cmdline_chars = _estimate_windows_cmdline_length(list(inputs))
+
+    if (
+        individual_file_count >= WINDOWS_ARG_LIST_WARNING_COUNT
+        or estimated_cmdline_chars >= WINDOWS_CMDLINE_WARNING_CHARS
+    ):
+        return (
+            "Large file-drop detected. On Windows, dragging many individual files can "
+            "exceed command-line limits before the app starts. For large batches, drag "
+            "the containing folder onto this EXE instead."
+        )
+
+    return None
 
 
 def _prepare_output_dir(output_dir: Path) -> Path:
@@ -483,9 +551,13 @@ def resolve_output_path(
     overwrite_existing_output: bool = False,
     reserved_paths: Optional[set[Path]] = None,
 ) -> Path:
-    """Resolve deterministic output path with predictable collision handling."""
+    """Resolve deterministic output path with predictable collision handling.
+
+    overwrite_existing_output is intentionally ignored to prevent file replacement.
+    """
     if overwrite_existing_output:
-        return output_dir / _build_cleaned_filename(input_file.stem, 0)
+        # Safety invariant: never overwrite an existing file.
+        overwrite_existing_output = False
 
     reserved = reserved_paths or set()
     attempt = 0
@@ -572,6 +644,15 @@ def clean_pdf(
                 output_dir=output_dir_resolved,
                 overwrite_existing_output=runtime.overwrite_existing_output,
             )
+        else:
+            target_output_path = Path(target_output_path)
+            target_output_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_output_path.exists():
+                target_output_path = resolve_output_path(
+                    input_file=input_file,
+                    output_dir=target_output_path.parent,
+                    overwrite_existing_output=False,
+                )
 
         try:
             input_inspection = inspect_pdf(input_file)
@@ -830,6 +911,7 @@ def clean_batch(
     runtime_settings: Optional[RuntimeSettings] = None,
     gs_exe: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> BatchSummary:
     """Clean many PDFs and return aggregate metrics plus per-file diagnostics."""
     runtime = runtime_settings or RuntimeSettings()
@@ -891,29 +973,48 @@ def clean_batch(
     worker_count = _resolve_worker_count(pdf_file_count=pdf_file_count, batch_settings=batch)
 
     results: list[Optional[RepairDiagnostics]] = [None] * len(planned_tasks)
+    total_planned_tasks = len(planned_tasks)
+    completed_tasks = 0
+
+    def _store_result(index: int, diagnostics: RepairDiagnostics) -> None:
+        """Store one task result and emit optional progress updates."""
+        nonlocal completed_tasks
+        if results[index] is not None:
+            return
+        results[index] = diagnostics
+        completed_tasks += 1
+        if progress_callback:
+            progress_callback(completed_tasks, total_planned_tasks)
 
     if worker_count == 1:
         for index, task in enumerate(planned_tasks):
-            results[index] = clean_pdf(
-                input_path=task.input_path,
-                output_dir=task.output_dir,
-                requested_mode=requested_mode,
-                runtime_settings=runtime,
-                gs_exe=resolved_gs,
-                output_path=task.output_path,
+            _store_result(
+                index,
+                clean_pdf(
+                    input_path=task.input_path,
+                    output_dir=task.output_dir,
+                    requested_mode=requested_mode,
+                    runtime_settings=runtime,
+                    gs_exe=resolved_gs,
+                    output_path=task.output_path,
+                ),
             )
     else:
+        pool_broken = False
         futures = {}
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             for index, task in enumerate(planned_tasks):
                 if task.output_path is None:
-                    results[index] = clean_pdf(
-                        input_path=task.input_path,
-                        output_dir=task.output_dir,
-                        requested_mode=requested_mode,
-                        runtime_settings=runtime,
-                        gs_exe=resolved_gs,
-                        output_path=None,
+                    _store_result(
+                        index,
+                        clean_pdf(
+                            input_path=task.input_path,
+                            output_dir=task.output_dir,
+                            requested_mode=requested_mode,
+                            runtime_settings=runtime,
+                            gs_exe=resolved_gs,
+                            output_path=None,
+                        ),
                     )
                     continue
 
@@ -930,23 +1031,45 @@ def clean_batch(
             for future in as_completed(futures):
                 index, task = futures[future]
                 try:
-                    results[index] = future.result()
+                    _store_result(index, future.result())
+                except BrokenProcessPool:
+                    # Recover by rerunning unresolved tasks sequentially.
+                    pool_broken = True
                 except Exception as exc:
                     # Worker crashes should not fail the full batch.
-                    results[index] = _build_diagnostics(
-                        input_file=task.input_path,
-                        output_path=task.output_path,
-                        success=False,
-                        skipped=False,
-                        mode_used=ERROR_MODE_LABEL,
-                        input_size=0,
-                        output_size=0,
-                        input_inspection=_empty_inspection(),
-                        final_inspection=_empty_inspection(),
-                        message="Worker process failed.",
-                        failure_reason=f"worker_error: {exc}",
-                        elapsed_seconds=0.0,
+                    _store_result(
+                        index,
+                        _build_diagnostics(
+                            input_file=task.input_path,
+                            output_path=task.output_path,
+                            success=False,
+                            skipped=False,
+                            mode_used=ERROR_MODE_LABEL,
+                            input_size=0,
+                            output_size=0,
+                            input_inspection=_empty_inspection(),
+                            final_inspection=_empty_inspection(),
+                            message="Worker process failed.",
+                            failure_reason=f"worker_error: {exc}",
+                            elapsed_seconds=0.0,
+                        ),
                     )
+
+        if pool_broken:
+            for index, task in enumerate(planned_tasks):
+                if results[index] is not None:
+                    continue
+                _store_result(
+                    index,
+                    clean_pdf(
+                        input_path=task.input_path,
+                        output_dir=task.output_dir,
+                        requested_mode=requested_mode,
+                        runtime_settings=runtime,
+                        gs_exe=resolved_gs,
+                        output_path=task.output_path,
+                    ),
+                )
 
     finalized_results = tuple(result for result in results if result is not None)
 
@@ -1015,18 +1138,86 @@ def print_diagnostics(diagnostics: RepairDiagnostics) -> None:
         print(f"[FAILURE] {diagnostics.failure_reason}")
 
 
-def print_batch_summary(summary: BatchSummary) -> None:
-    """Emit aggregate batch metrics."""
-    print("\n[SUMMARY]")
-    print(f"total_files={summary.total_files}")
-    print(f"succeeded={summary.succeeded}")
-    print(f"failed={summary.failed}")
-    print(f"skipped={summary.skipped}")
-    print(f"text_pdfs_processed={summary.text_pdfs_processed}")
-    print(f"image_only_pdfs_processed={summary.image_only_pdfs_processed}")
-    print(f"worker_count={summary.worker_count}")
-    print(f"total_processing_seconds={summary.total_processing_seconds:.3f}")
-    print(f"average_processing_seconds={summary.average_processing_seconds:.3f}")
+def print_batch_summary(summary: BatchSummary, wall_clock_seconds: float) -> None:
+    """Emit user-friendly aggregate batch metrics."""
+    processed_files = max(0, summary.succeeded + summary.failed)
+    average_wall_time_per_processed_file = (
+        wall_clock_seconds / processed_files if processed_files > 0 else 0.0
+    )
+
+    print("\n[Summary]")
+    print(f"Total files: {summary.total_files}")
+    print(f"Succeeded: {summary.succeeded}")
+    print(f"Failed: {summary.failed}")
+    print(f"Skipped: {summary.skipped}")
+    print(f"Text PDFs processed: {summary.text_pdfs_processed}")
+    print(f"Image-only PDFs processed: {summary.image_only_pdfs_processed}")
+    print(f"Worker count: {summary.worker_count}")
+    print(f"Wall time: {wall_clock_seconds:.3f} seconds")
+    print(
+        "Average wall time per processed file: "
+        f"{average_wall_time_per_processed_file:.3f} seconds"
+    )
+
+
+def _select_console_results(
+    summary: BatchSummary,
+    show_all_results: bool,
+) -> tuple[RepairDiagnostics, ...]:
+    """Select per-file diagnostics to print for console performance and clarity."""
+    if show_all_results:
+        return summary.results
+
+    if summary.total_files <= DEFAULT_DETAILED_CONSOLE_RESULT_LIMIT:
+        return summary.results
+
+    return tuple(
+        result for result in summary.results if result.skipped or not result.success
+    )
+
+
+def _build_progress_reporter() -> ProgressCallback:
+    """Build a throttled progress reporter for interactive CLI/EXE runs."""
+    started_at = time.perf_counter()
+    last_emitted_at = 0.0
+    has_tty_stdout = bool(sys.stdout) and sys.stdout.isatty()
+
+    def report(completed: int, total: int) -> None:
+        nonlocal last_emitted_at
+        if total <= 0:
+            return
+
+        now = time.perf_counter()
+        is_final = completed >= total
+        progress_step = max(1, total // 100)
+        should_emit = (
+            is_final
+            or (completed % progress_step == 0)
+            or ((now - last_emitted_at) >= PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
+        )
+        if not should_emit:
+            return
+
+        elapsed_seconds = max(0.0, now - started_at)
+        percent = (completed / total) * 100.0
+        rate = (completed / elapsed_seconds) if elapsed_seconds > 0 else 0.0
+        eta_seconds = ((total - completed) / rate) if rate > 0 else 0.0
+        line = (
+            f"[PROGRESS] {completed}/{total} ({percent:.1f}%) "
+            f"elapsed={elapsed_seconds:.1f}s eta~{eta_seconds:.1f}s"
+        )
+
+        if has_tty_stdout:
+            if is_final:
+                print(f"\r{line}")
+            else:
+                print(f"\r{line}", end="", flush=True)
+        elif is_final:
+            print(line)
+
+        last_emitted_at = now
+
+    return report
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1071,7 +1262,18 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        help="Overwrite existing <stem>_cleaned.pdf instead of creating suffixes.",
+        help=(
+            "Deprecated safety flag. Existing files are never overwritten; "
+            "this option is ignored."
+        ),
+    )
+    parser.add_argument(
+        "--show-all-results",
+        action="store_true",
+        help=(
+            "Print per-file success lines even for large batches. "
+            "By default, large runs print only failures/skips plus summary."
+        ),
     )
     parser.add_argument(
         "inputs",
@@ -1090,17 +1292,26 @@ def main(argv: Sequence[str]) -> int:
             "Outputs are created automatically in a fixed_pdf folder "
             "next to each dropped source."
         )
+        if _should_force_windows_exit_pause():
+            _pause_for_windows_dragdrop(force_windows_pause=True)
         return 0
+
+    windows_bulk_warning = _build_windows_bulk_drop_warning(args.inputs)
+    if windows_bulk_warning:
+        print(f"[NOTICE] {windows_bulk_warning}")
+    if args.overwrite_output:
+        print(f"[NOTICE] {OVERWRITE_IGNORED_NOTICE}")
 
     requested_mode = RequestedMode(args.mode)
     runtime_settings = RuntimeSettings(
-        overwrite_existing_output=bool(args.overwrite_output),
+        overwrite_existing_output=False,
     )
     batch_settings = BatchSettings(
         enable_parallel=not args.no_parallel,
         max_workers=args.workers,
     )
 
+    batch_started_at = time.perf_counter()
     summary = clean_batch(
         input_paths=args.inputs,
         requested_mode=requested_mode,
@@ -1108,18 +1319,36 @@ def main(argv: Sequence[str]) -> int:
         runtime_settings=runtime_settings,
         gs_exe=_build_gs_path(sys.argv[0]),
         output_dir=args.output_dir,
+        progress_callback=_build_progress_reporter(),
+    )
+    wall_clock_seconds = time.perf_counter() - batch_started_at
+
+    results_to_print = _select_console_results(
+        summary=summary,
+        show_all_results=bool(args.show_all_results),
     )
 
-    for diagnostics in summary.results:
+    suppressed_successes = len(summary.results) - len(results_to_print)
+    if suppressed_successes > 0:
+        print(
+            "[NOTICE] "
+            f"Suppressed {suppressed_successes} successful per-file result lines "
+            "for large-batch performance. Use --show-all-results to print every file."
+        )
+
+    for diagnostics in results_to_print:
         print_diagnostics(diagnostics)
 
-    print_batch_summary(summary)
+    print_batch_summary(summary, wall_clock_seconds=wall_clock_seconds)
 
-    if summary.failed > 0:
+    if _should_force_windows_exit_pause():
+        _pause_for_windows_dragdrop(force_windows_pause=True)
+    elif summary.failed > 0:
         _pause_for_windows_dragdrop()
 
     return 0
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main(sys.argv[1:]))

@@ -1,53 +1,132 @@
-# PDFCleaner - Structural PDF Normalization (Python)
+# PDFCleaner - Structural-First PDF Repair
 
-PDFCleaner keeps Python as the batch/orchestration layer and now uses a **structural-first** repair pipeline:
+PDFCleaner is a Python-based PDF repair tool designed for drag-and-drop usage and packaging as a standalone Windows executable.
 
-1. Inspect input PDF characteristics
-2. Normalize/rewrite structure with `pikepdf` (qpdf-backed)
-3. Validate key output characteristics
-4. Fall back to Ghostscript compatibility conversion only when required
+## Behavior Overview
 
-## Why this change
+The default pipeline is structural-first and non-destructive:
 
-The previous default path always ran Ghostscript PDF/A conversion, which can rasterize/rewrite aggressively and increase file size. The default path now avoids full-page rasterization whenever structural normalization is sufficient.
+1. Inspect PDF structure/content to classify as `text_or_vector` or `image_only`
+2. For text/vector PDFs: run structural normalization only (pikepdf/qpdf-backed)
+3. Validate structural output against key characteristics (page count, text layer, fonts, size growth)
+4. For image-only PDFs in `auto`: copy through without raster rewrite
+5. Write cleaned output to a separate output folder (never overwrite input)
 
-## Features
+`ghostscript` mode remains explicit opt-in only.
 
-- Python drag-and-drop batch processing stays intact
-- Default `auto` mode: structural-first, fallback only if needed
-- `structural` mode: structural normalization only (no fallback)
-- `ghostscript` mode: explicit compatibility conversion
-- Per-file diagnostics:
-  - mode used
-  - text preserved (`yes/no`)
-  - fonts present (`yes/no`)
-  - output size change
+## Default Output Policy
 
-## Usage
+Default output folder name is:
 
-Drag one or more PDFs onto `pdf_cleaner.exe` (or run script directly).
+`fixed_pdf`
 
-### CLI modes
+Default routing rules:
+
+- If you drop one or more files from a folder: outputs go to `<source_folder>/fixed_pdf/`
+- If you drop a folder: outputs go to `<dropped_folder>/fixed_pdf/`
+- If you drop mixed-source files in one run: each source folder gets its own `fixed_pdf` folder (per-source policy)
+
+Output filename format:
+
+`<original_stem>_cleaned.pdf`
+
+Collision handling:
+
+- If the target name already exists, numeric suffixes are appended deterministically:
+  - `<stem>_cleaned_1.pdf`
+  - `<stem>_cleaned_2.pdf`
+  - etc.
+
+## Running the Tool
+
+### Drag-and-drop (primary workflow)
+
+- Drag one or more PDF files or folders onto `pdf_cleaner.exe`
+- The tool processes all discovered PDFs and writes outputs using the default policy above
+
+### CLI usage
 
 ```bash
-python pdf_cleaner.py --mode auto input1.pdf input2.pdf
+python pdf_cleaner.py input1.pdf input2.pdf
 python pdf_cleaner.py --mode structural input.pdf
 python pdf_cleaner.py --mode ghostscript input.pdf
+python pdf_cleaner.py --workers 4 C:\path\to\folder
 ```
 
-## Included files
+Optional flags:
 
-- `pdf_cleaner.py` - Python source
-- `pdf_cleaner.exe` - packaged executable
-- `bin/gswin64c.exe` and `bin/gsdll64.dll` - Ghostscript runtime
+- `--output-dir <path>`: override default per-source `fixed_pdf` routing
+- `--no-parallel`: force sequential batch processing
+- `--overwrite-output`: reuse `<stem>_cleaned.pdf` instead of creating suffixes
+
+## Modes
+
+- `auto` (default):
+  - Text/vector PDFs: structural normalization only
+  - Image-only PDFs: passthrough copy
+  - No Ghostscript fallback for text/vector PDFs
+- `structural`:
+  - Structural normalization only
+- `ghostscript`:
+  - Explicit compatibility conversion
+
+## Batch Summary
+
+Batch execution reports:
+
+- total files
+- succeeded
+- failed
+- skipped
+- text PDFs processed
+- image-only PDFs processed
+- total processing time
+- average processing time
+- per-file output path and failure reason
+
+One file failure does not stop the batch.
 
 ## Tests
 
-Run tests with your `pdfclean` conda environment:
+Run:
 
 ```bash
-C:\Users\ali_a\miniconda3\envs\pdfclean\python.exe -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
+
+## Packaging a Portable Standalone Windows EXE
+
+Recommended build approach: **PyInstaller one-folder (`--onedir`)**
+
+Reason:
+
+- More reliable for native dependencies (`pikepdf`/qpdf libs)
+- Faster startup than one-file extraction
+- Easier to bundle Ghostscript binaries (`bin/gswin64c.exe`, `bin/gsdll64.dll`)
+- Better behavior for a drag-and-drop utility distributed as a portable folder
+
+### Build command (example)
+
+From repository root:
+
+```bash
+pyinstaller ^
+  --noconfirm ^
+  --clean ^
+  --onedir ^
+  --name pdf_cleaner ^
+  --add-binary "bin\\gswin64c.exe;bin" ^
+  --add-binary "bin\\gsdll64.dll;bin" ^
+  pdf_cleaner.py
+```
+
+Resulting deliverable:
+
+- `dist\pdf_cleaner\pdf_cleaner.exe` (plus bundled runtime files in same folder)
+
+### One-file EXE note
+
+`--onefile` is possible, but not preferred for this tool because startup extraction overhead and native dependency loading can be less predictable for high-volume drag-and-drop usage.
 
 ## License
 
